@@ -1,0 +1,29 @@
+# Third-party code: link it, don't vendor it (MedSAM is Apache-2.0, its own repo)
+Cloned_Repos/
+
+# Project notes kept out of the public repo -- only README.md is published
+*.md
+!README.md
+
+# Python / OS
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+
+# Data, checkpoints, results, logs -- never committed
+data/
+outputs/
+checkpoints/
+work_dir/
+*.pth
+*.pt
+*.npz
+*.npy
+*.nii
+*.nii.gz
+*.zip
+*.csv
+*.out
+*.err
+*.log
