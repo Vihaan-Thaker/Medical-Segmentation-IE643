@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -129,23 +130,111 @@ def _cuda_sync() -> None:
     charged to the first decode. Adds no work -- the first decode would wait anyway."""
     global _SYNC
     if _SYNC is None:
+        # Only if torch is already loaded (build_predictor imports it for every real run).
+        # A stub predictor in the tests never imports torch, and must not pay for it here.
+        torch = sys.modules.get("torch")
         try:
-            import torch
-            _SYNC = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+            _SYNC = (torch.cuda.synchronize if torch is not None and torch.cuda.is_available()
+                     else (lambda: None))
         except Exception:
             _SYNC = lambda: None  # noqa: E731
     _SYNC()
 
 
+# ------------------------------------------------------------- model stamp (D32)
+# Boxes, areas and keys do not depend on the model, so verify_rows cannot tell a ViT-H
+# row from a ViT-B row. Every results folder therefore carries model.json naming the
+# model and the exact checkpoint bytes that produced it, and every mode refuses a mismatch.
+MODEL_STAMP = "model.json"
+MODEL_TAGS = ("vit_h", "vit_l", "vit_b")
+STAMP_KEYS = ("model_type", "checkpoint_name", "checkpoint_bytes", "checkpoint_sha256")
+
+
+def checkpoint_identity(checkpoint: Path, model_type: str) -> dict:
+    """Model type plus the checkpoint's name, size and sha256. Refuses a checkpoint whose
+    name names a different model (e.g. --model-type vit_b with sam_vit_h_*.pth); a name
+    with no model tag is allowed, the sha256 identifies it either way."""
+    tags = [t for t in MODEL_TAGS if t in checkpoint.name]
+    if tags and tags != [model_type]:
+        raise SystemExit(f"--model-type {model_type} does not match checkpoint "
+                         f"{checkpoint.name} (names {', '.join(tags)})")
+    h = hashlib.sha256()
+    with open(checkpoint, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 23), b""):
+            h.update(block)
+    return {"model_type": model_type, "checkpoint_name": checkpoint.name,
+            "checkpoint_bytes": checkpoint.stat().st_size, "checkpoint_sha256": h.hexdigest()}
+
+
+def _write_stamp(folder: Path, ident: dict) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / (MODEL_STAMP + ".tmp")
+    with open(tmp, "w") as fh:
+        json.dump({k: ident[k] for k in STAMP_KEYS}, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, folder / MODEL_STAMP)
+
+
+def check_stamp(folder: Path, ident: dict, write: bool) -> str:
+    """Ensure `folder` holds results of exactly this model, or none yet. Raises SystemExit
+    on a mismatch, before anything in the folder is read for reuse, rewritten or backed up.
+    With write=True a missing stamp is created. Returns what was found, for the log.
+
+    A folder with results but no stamp predates D32. It is accepted only if its run.json
+    names this model type and checkpoint file (the ViT-H arm-1 folders all have one);
+    otherwise it is refused, since nothing says which model produced those rows."""
+    stamp = folder / MODEL_STAMP
+    if stamp.exists():
+        with open(stamp) as fh:
+            have = json.load(fh)
+        diff = [k for k in STAMP_KEYS if have.get(k) != ident[k]]
+        if diff:
+            raise SystemExit(
+                f"{folder} holds results of a different model or checkpoint "
+                f"(differs in {', '.join(diff)}):\n  folder: "
+                + ", ".join(f"{k}={have.get(k)}" for k in diff) + "\n  this run: "
+                + ", ".join(f"{k}={ident[k]}" for k in diff)
+                + "\nUse a separate --out for each model.")
+        return "stamp matches"
+    has_results = any((folder / n).exists() for n in ("instances.csv", "volumes_3d.csv"))
+    if not has_results:
+        if write:
+            _write_stamp(folder, ident)
+        return "new folder, stamped" if write else "no results yet"
+    rj_path = folder / "run.json"
+    rj = {}
+    if rj_path.exists():
+        try:
+            rj = json.loads(rj_path.read_text())
+        except json.JSONDecodeError:
+            rj = {}
+    a = rj.get("args", {})
+    if (a.get("model_type") == ident["model_type"]
+            and Path(a.get("checkpoint", "")).name == ident["checkpoint_name"]):
+        if write:
+            _write_stamp(folder, ident)
+        return "legacy folder (pre-D32): run.json names this model" + (", stamped" if write else "")
+    raise SystemExit(
+        f"{folder} holds results with no {MODEL_STAMP}, and "
+        + (f"its run.json names model_type={a.get('model_type')}, "
+           f"checkpoint={Path(a.get('checkpoint', '')).name or None}" if rj else "no run.json")
+        + f" -- cannot confirm they come from {ident['model_type']} / {ident['checkpoint_name']}. "
+          "Use a separate --out for each model.")
+
+
 # -------------------------------------------------------------------- manifest IO
-def load_manifest(processed: Path) -> list[dict]:
+def load_manifest(processed: Path, splits: tuple[str, ...] = EVAL_SPLITS) -> list[dict]:
+    """Manifest rows of the given splits, parsed and box-validated. The default (test +
+    external) is what every evaluation uses; arm-2 training asks for ("train",) / ("val",)
+    and gets exactly the same parsing and checks (D34)."""
     with open(processed / "manifest.csv") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
         raise SystemExit(f"{processed / 'manifest.csv'} is empty")
     out = []
     for r in rows:
-        if r["split"] not in EVAL_SPLITS:
+        if r["split"] not in splits:
             continue
         r["z"] = int(r["z"])
         r["n_slices"] = int(r["n_slices"])
@@ -782,6 +871,9 @@ def main(argv: list[str] | None = None) -> int:
             p.error(f"--{name.replace('_', '-')} is required unless --self-test")
     if not args.checkpoint.exists():
         raise SystemExit(f"checkpoint not found: {args.checkpoint}")
+    ident = checkpoint_identity(args.checkpoint, args.model_type)
+    print(f"model: {ident['model_type']}  checkpoint: {ident['checkpoint_name']}  "
+          f"{ident['checkpoint_bytes']} bytes  sha256 {ident['checkpoint_sha256'][:16]}...")
 
     rows = load_manifest(args.processed)
     cases = group_cases(rows)
@@ -818,8 +910,22 @@ def main(argv: list[str] | None = None) -> int:
               f"(group: (found, expected)): {diff}\n\nEVAL_FAILED")
         return 1
 
-    # Where this job writes, and which cases it owns.
+    # ---- model stamp (D32): checked before any existing result is read for reuse,
+    # rewritten or backed up. Shards never write the base folder; the merge stamps it last.
     is_shard = args.shard is not None
+    if is_shard:
+        print(f"model stamp, base:  {check_stamp(args.out, ident, write=False)}")
+        print(f"model stamp, shard: "
+              f"{check_stamp(shard_dir(args.out, args.shard, args.num_shards), ident, write=True)}")
+    elif args.merge:
+        print(f"model stamp, base: {check_stamp(args.out, ident, write=False)}")
+        for k in range(args.merge):
+            print(f"model stamp, shard {k}/{args.merge}: "
+                  f"{check_stamp(shard_dir(args.out, k, args.merge), ident, write=False)}")
+    else:
+        print(f"model stamp: {check_stamp(args.out, ident, write=True)}")
+
+    # Where this job writes, and which cases it owns.
     if is_shard:
         work, my_scope = setup_shard(args.out, args.shard, args.num_shards, cases, scope,
                                      manifest_by_key)
@@ -858,6 +964,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  !! {m}")
             print("\nEVAL_FAILED")
             return 1
+        if not (args.out / MODEL_STAMP).exists():
+            _write_stamp(args.out, ident)   # base was checked above, before the merge
         todo, mode = [], "a"                # nothing to score: verify + QC only
     elif resume and (inst_path.exists() or vol_path.exists()):
         a = audit_outputs(inst_path, vol_path, cases, my_scope)
@@ -978,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dump({
             "args": {k: str(v) for k, v in vars(args).items()},
             "mode": label,
+            "model": {k: ident[k] for k in STAMP_KEYS},
             "finished": time.strftime("%Y-%m-%d %H:%M:%S"), "host": platform.node(),
             "python": platform.python_version(),
             "versions": {"numpy": np.__version__, "pillow": PIL.__version__},

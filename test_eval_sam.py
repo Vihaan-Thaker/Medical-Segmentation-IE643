@@ -9,9 +9,16 @@ independently of the code under test.
 """
 from __future__ import annotations
 
+import os
+
+# The suite uses tiny arrays. On a shared login node, numerical libraries otherwise start
+# one thread per core of the whole machine and stall each other (the same oversubscription
+# that slowed job 336480, D26). Set before numpy is imported.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import csv
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -120,8 +127,15 @@ def test_metrics() -> None:
     # by ~0.14 even on square pixels (arXiv 2410.02630; D24a/C1 is why we use DeepMind).
     # Equal ranking still catches API misuse -- swapped arguments or transposed spacing
     # would break monotonicity.
+    # Opt-in: it imports torch + MONAI, which can take minutes on a busy login node, and it
+    # re-validates a library choice already settled (D24a/C1). Run it with
+    #   IE643_MONAI_CHECK=1 python test_eval_sam.py
+    if os.environ.get("IE643_MONAI_CHECK") != "1":
+        print("  --  MONAI ranking cross-check skipped (opt-in: IE643_MONAI_CHECK=1)")
+        return
     try:
         import torch
+        torch.set_num_threads(1)
         from monai.metrics import compute_surface_dice
         oh = lambda m: torch.from_numpy(np.stack([~m, m])[None]).float()
         ours, mon = [], []
@@ -613,6 +627,8 @@ def test_sharding() -> None:
     base_v = [r for r in rows(ref / "volumes_3d.csv") if r["case"] in keep_full]
     eval_sam._rewrite(out / "instances.csv", eval_sam.INSTANCE_FIELDS, base_i)
     eval_sam._rewrite(out / "volumes_3d.csv", eval_sam.VOLUME_FIELDS, base_v)
+    # A real run stamps its folder with the model that produced it (D32).
+    eval_sam._write_stamp(out, eval_sam.checkpoint_identity(ckpt, "vit_h"))
     before = digest(out)
 
     N = 3
@@ -711,6 +727,214 @@ def test_sharding() -> None:
     print(f"scratch: {tmp}")
 
 
+def _tree_digest(folder: Path) -> dict:
+    """sha256 of every file under folder: 'untouched' means byte-identical, stamp included."""
+    import hashlib
+    return {str(f.relative_to(folder)): hashlib.sha256(f.read_bytes()).hexdigest()
+            for f in sorted(folder.rglob("*")) if f.is_file()}
+
+
+def test_model_stamp() -> None:
+    """D32: a results folder is tied to the exact model + checkpoint that produced it.
+    Boxes and areas do not depend on the model, so without this a ViT-B resume, shard or
+    merge would silently accept ViT-H rows as its own."""
+    print("\n--- model stamp: one folder, one model ---")
+    import hashlib
+    tmp = Path(tempfile.mkdtemp(prefix="arm1_stamp_"))
+    proc = tmp / "processed"
+    build_synthetic(proc)
+    use_synthetic_anchors(proc)
+    stub = StubPredictor({})
+    eval_sam.build_predictor = lambda *a, **k: stub
+    ck_h = tmp / "sam_vit_h_fake.pth"
+    ck_h.write_bytes(b"H weights")
+    ck_b = tmp / "sam_vit_b_fake.pth"
+    ck_b.write_bytes(b"B weights")
+    ck_h2 = tmp / "other" / "sam_vit_h_fake.pth"           # same name, different bytes
+    ck_h2.parent.mkdir()
+    ck_h2.write_bytes(b"H weights, re-downloaded wrong")
+
+    def argv(out, model, ck, *extra):
+        return ["--processed", str(proc), "--checkpoint", str(ck), "--out", str(out),
+                "--model-type", model, "--device", "cpu", "--qc-per-group", "2", *extra]
+
+    def refused(args, needle):
+        try:
+            eval_sam.main(args)
+        except SystemExit as e:
+            return needle in str(e)
+        return False
+
+    out = tmp / "arm1"
+    check(eval_sam.main(argv(out, "vit_h", ck_h)) == 0, "a ViT-H run succeeds")
+    st = json.loads((out / "model.json").read_text())
+    check(st == {"model_type": "vit_h", "checkpoint_name": "sam_vit_h_fake.pth",
+                 "checkpoint_bytes": len(b"H weights"),
+                 "checkpoint_sha256": hashlib.sha256(b"H weights").hexdigest()},
+          "model.json records model type, checkpoint name, size and sha256")
+    check(json.loads((out / "run.json").read_text())["model"] == st, "run.json carries the same identity")
+
+    before = _tree_digest(out)
+    check(refused(argv(out, "vit_b", ck_b, "--resume"), "different model"),
+          "a ViT-B resume on a ViT-H folder is refused")
+    check(refused(argv(out, "vit_h", ck_h2, "--resume"), "checkpoint_sha256"),
+          "same model name but different checkpoint bytes is refused")
+    check(refused(argv(out, "vit_b", ck_b, "--overwrite"), "different model"),
+          "--overwrite does not let a ViT-B run take over a ViT-H folder")
+    check(_tree_digest(out) == before, "every refusal leaves the folder byte-identical")
+
+    stub.n_set_image = 0
+    fresh = tmp / "fresh"
+    check(refused(argv(fresh, "vit_b", ck_h), "does not match checkpoint"),
+          "--model-type vit_b with a vit_h-named checkpoint is refused")
+    check(not (fresh / "model.json").exists() and stub.n_set_image == 0,
+          "...before stamping anything or loading the model")
+
+    # Legacy (pre-D32) folders: no stamp, but run.json names the model.
+    legacy = tmp / "legacy"
+    shutil.copytree(out, legacy)
+    (legacy / "model.json").unlink()
+    check(refused(argv(legacy, "vit_b", ck_b, "--resume"), "cannot confirm"),
+          "a legacy ViT-H folder is refused by ViT-B")
+    check(not (legacy / "model.json").exists(), "...and is not stamped by the refused run")
+    check(eval_sam.main(argv(legacy, "vit_h", ck_h, "--resume")) == 0
+          and json.loads((legacy / "model.json").read_text()) == st,
+          "a legacy ViT-H folder is accepted by ViT-H and gets stamped")
+    orphan = tmp / "orphan"
+    orphan.mkdir()
+    for n_ in ("instances.csv", "volumes_3d.csv"):
+        shutil.copy(out / n_, orphan / n_)
+    check(refused(argv(orphan, "vit_h", ck_h, "--resume"), "no run.json"),
+          "results with neither model.json nor run.json are refused")
+
+    # Shards: base checked read-only, before the shard folder is even created.
+    check(refused(argv(out, "vit_b", ck_b, "--shard", "0", "--num-shards", "2"), "different model"),
+          "a ViT-B shard on a ViT-H base is refused")
+    check(not (out / "shards").exists() and _tree_digest(out) == before,
+          "...without creating its shard folder or touching the base")
+
+    # Merge: every shard folder must carry the same model.
+    sh = tmp / "sharded"
+    for k in range(2):
+        check(eval_sam.main(argv(sh, "vit_h", ck_h, "--shard", str(k), "--num-shards", "2")) == 0,
+              f"ViT-H shard {k}/2 succeeds")
+        check(json.loads((eval_sam.shard_dir(sh, k, 2) / "model.json").read_text()) == st,
+              f"shard {k}/2 folder is stamped")
+    check(not (sh / "model.json").exists(), "shards never write the base folder's stamp")
+    s1 = eval_sam.shard_dir(sh, 1, 2) / "model.json"
+    good = s1.read_text()
+    s1.write_text(json.dumps(dict(st, checkpoint_sha256="0" * 64)))
+    check(refused(argv(sh, "vit_h", ck_h, "--merge", "2"), "different model"),
+          "the merge refuses a shard produced by a different checkpoint")
+    check(not (sh / "instances.csv").exists() and not (sh / "model.json").exists(),
+          "...and writes nothing to the base")
+    s1.write_text(good)
+    check(refused(argv(sh, "vit_b", ck_b, "--merge", "2"), "different model"),
+          "a ViT-B merge of ViT-H shards is refused")
+    check(eval_sam.main(argv(sh, "vit_h", ck_h, "--merge", "2")) == 0
+          and json.loads((sh / "model.json").read_text()) == st,
+          "the matching merge succeeds and stamps the base")
+    restore_anchors()
+
+
+def test_compare_arms() -> None:
+    """compare_arms.py: pairs two runs kidney by kidney, refuses unless they used identical
+    prompts, and reports B - A with a paired bootstrap whose means equal aggregate_arm's."""
+    print("\n--- compare_arms: paired comparison of two runs ---")
+    import compare_arms
+
+    a_, b_ = [0.5, 0.7, 0.9], [0.6, 0.8, 1.0]
+    ma, mb, d, lo, hi = M.paired_bootstrap_diff(a_, b_, n_boot=500)
+    check(abs(ma - 0.7) < 1e-12 and abs(mb - 0.8) < 1e-12 and abs(d - 0.1) < 1e-12
+          and abs(lo - 0.1) < 1e-9 and abs(hi - 0.1) < 1e-9,
+          "paired bootstrap: a constant +0.1 per patient gives delta 0.1 with a zero-width CI")
+    ma, mb, d, lo, hi = M.paired_bootstrap_diff(a_, a_, n_boot=500)
+    check(d == 0 and lo == 0 and hi == 0, "paired bootstrap: identical arms give exactly 0")
+    for bad, why in (((a_, a_[:2]), "unequal lengths"), (([0.1, float("nan")], [0.1, 0.2]), "NaN")):
+        try:
+            M.paired_bootstrap_diff(*bad)
+            check(False, f"{why} must raise")
+        except M.MetricError:
+            check(True, f"paired bootstrap rejects {why}")
+
+    tmp = Path(tempfile.mkdtemp(prefix="arm1_compare_"))
+    proc = tmp / "processed"
+    build_synthetic(proc)
+    use_synthetic_anchors(proc)
+    runs = {}
+    for name, model, delta in (("A", "vit_h", -2), ("B", "vit_b", -1)):
+        ck = tmp / f"sam_{model}_fake.pth"
+        ck.write_bytes(model.encode())
+        stub = StubPredictor({}, radius_delta=delta)      # B's masks are closer to the truth
+        eval_sam.build_predictor = lambda *a, s=stub, **k: s
+        out = tmp / name
+        check(eval_sam.main(["--processed", str(proc), "--checkpoint", str(ck), "--out", str(out),
+                             "--model-type", model, "--device", "cpu", "--qc-per-group", "2"]) == 0,
+              f"run {name} ({model}) succeeds")
+        check(aggregate_arm.main(["--arm-dir", str(out), "--n-boot", "200"]) == 0, f"run {name} aggregates")
+        runs[name] = out
+    restore_anchors()
+
+    def cmp_(a, b, out):
+        return compare_arms.main(["--a", str(a), "--b", str(b), "--out", str(out), "--n-boot", "300"])
+
+    check(cmp_(runs["A"], runs["B"], tmp / "cmp") == 0, "compare A vs B succeeds (COMPARE_OK)")
+    rows = list(csv.DictReader(open(tmp / "cmp" / "compare.csv")))
+    n_groups = 2
+    check(len(rows) == n_groups * len(M.JITTER_LEVELS) * (2 * (1 + len(M.TOLERANCES_MM))),
+          f"compare.csv: one row per group x jitter x metric, 2D and 3D ({len(rows)})")
+    summ = {name: list(csv.DictReader(open(runs[name] / "summary.csv"))) for name in runs}
+    worst = 0.0
+    for r in rows:
+        for name, col in (("A", "mean_a"), ("B", "mean_b")):
+            s_ = next(x for x in summ[name] if x["group"] == r["group"] and x["metric"] == r["metric"]
+                      and x["level"] == r["level"] and abs(float(x["jitter"]) - float(r["jitter"])) < 1e-9)
+            worst = max(worst, abs(float(s_["mean"]) - float(r[col])))
+    check(worst <= 1e-4, f"every compare mean equals aggregate_arm's summary mean (max diff {worst:.1e})")
+    check(all(abs(float(r["delta"]) - (float(r["mean_b"]) - float(r["mean_a"]))) <= 2e-4
+              and float(r["ci_lo"]) <= float(r["delta"]) + 1e-9 <= float(r["ci_hi"]) + 2e-9 for r in rows),
+          "delta = mean B - mean A, inside its CI, on every row")
+    d0 = [r for r in rows if r["level"] == "2d" and r["metric"] == "dice" and float(r["jitter"]) == 0.0]
+    check(len(d0) == n_groups and all(float(r["delta"]) > 0 for r in d0),
+          "the closer stub masks (B) score higher Dice than A at 0% jitter, as constructed")
+    check((tmp / "cmp" / "compare.md").exists(), "compare.md written")
+
+    # It must refuse anything that is not a like-for-like pairing.
+    def variant(tag, mutate):
+        v = tmp / f"B_{tag}"
+        shutil.copytree(runs["B"], v)
+        mutate(v)
+        return v
+
+    def edit_rows(v, fn):
+        rs = list(csv.DictReader(open(v / "instances.csv")))
+        rs = fn(rs)
+        eval_sam._rewrite(v / "instances.csv", eval_sam.INSTANCE_FIELDS, rs)
+
+    def shift_box(rs):
+        b = json.loads(rs[0]["box_jit"])
+        rs[0]["box_jit"] = json.dumps([b[0] + 1, b[1], b[2], b[3]])
+        return rs
+
+    def problems_json(v):
+        rj = json.loads((v / "run.json").read_text())
+        rj["problems"] = ["something failed"]
+        (v / "run.json").write_text(json.dumps(rj))
+
+    for tag, mutate, why in (
+        ("box", lambda v: edit_rows(v, shift_box), "one jittered box differs"),
+        ("drop", lambda v: edit_rows(v, lambda rs: rs[1:]), "one instance row missing"),
+        ("gt", lambda v: edit_rows(v, lambda rs: [dict(r, gt_area=str(int(r["gt_area"]) + 1))
+                                                   if i == 0 else r for i, r in enumerate(rs)]),
+         "one GT area differs"),
+        ("cert", problems_json, "run.json reports problems"),
+        ("norun", lambda v: (v / "run.json").unlink(), "no run.json"),
+    ):
+        v = variant(tag, mutate)
+        check(cmp_(runs["A"], v, tmp / f"cmp_{tag}") == 1 and not (tmp / f"cmp_{tag}").exists(),
+              f"compare refuses (COMPARE_FAILED, writes nothing) when {why}")
+
+
 def test_sbatch_scripts() -> None:
     """The 4 independent shard scripts + the merge script (D29): in sync with their
     generator, each runs exactly its own shard, and each refuses to start next to a job
@@ -719,7 +943,9 @@ def test_sbatch_scripts() -> None:
     print("\n--- SLURM scripts: 4 shards + merge ---")
     import subprocess
     here = Path(__file__).resolve().parent
-    names = [f"arm1_shard{k}.sbatch" for k in range(4)] + ["arm1_merge.sbatch"]
+    names = ([f"arm1_shard{k}.sbatch" for k in range(4)] + ["arm1_merge.sbatch"]
+             + ["arm1_vitb.sbatch", "arm1_vitb_shard0.sbatch", "arm1_vitb_shard1.sbatch",
+                "arm1_vitb_merge.sbatch"])
     tmp = Path(tempfile.mkdtemp(prefix="arm1_sbatch_"))
     regen = tmp / "regen"
     regen.mkdir()
@@ -731,7 +957,12 @@ def test_sbatch_scripts() -> None:
         r = subprocess.run(["bash", "-n", str(here / n)], capture_output=True)
         check(r.returncode == 0, f"{n} passes bash -n")
 
-    texts = {n: (here / n).read_text() for n in names}
+    arm2_names = ["arm2_preflight.sbatch", "arm2_r4_train.sbatch", "arm2_r8_train.sbatch",
+                  "arm2_select.sbatch", "arm2_r4_eval.sbatch", "arm2_r8_eval.sbatch",
+                  "arm2_compare.sbatch"]          # content tested in test_train_sam.py
+    check(sorted(p_.name for p_ in regen.glob("*.sbatch")) == sorted(names + arm2_names),
+          "gen_sbatch.py writes exactly the 16 expected scripts (9 arm 1 + 7 arm 2)")
+    texts = {n: (here / n).read_text() for n in names + ["eval_sam.sbatch"]}
     logs = [next(line for line in texts[n].splitlines() if line.startswith("#SBATCH --output"))
             for n in names]
     check(len(set(logs)) == len(logs), "every script logs to its own file")
@@ -743,6 +974,7 @@ def test_sbatch_scripts() -> None:
     seg = tmp / "Segmentation"
     (seg / "checkpoints").mkdir(parents=True)
     (seg / "checkpoints" / "sam_vit_h_4b8939.pth").write_bytes(b"x")
+    (seg / "checkpoints" / "sam_vit_b_01ec64.pth").write_bytes(b"y")
     stub_bin = tmp / "bin"
     stub_bin.mkdir()
     calls = tmp / "python_calls.txt"
@@ -754,7 +986,7 @@ def test_sbatch_scripts() -> None:
     for f in stub_bin.iterdir():
         f.chmod(0o755)
 
-    def run(name: str, queue: str) -> tuple[int, list[str]]:
+    def run(name: str, queue: str, **extra_env) -> tuple[int, list[str]]:
         script = texts[name].replace("/home/rethinkingai-self/vihaan/miniconda3/envs/seg311/bin/python",
                                      str(fake_py))
         script = script.replace("/home/rethinkingai-self/vihaan/Segmentation", str(seg))
@@ -765,7 +997,7 @@ def test_sbatch_scripts() -> None:
         if calls.exists():
             calls.unlink()
         env = dict(os.environ, PATH=f"{stub_bin}:{os.environ['PATH']}", FAKE_SQUEUE=str(q),
-                   SLURM_JOB_ID="900", SLURM_CPUS_ON_NODE="8")
+                   SLURM_JOB_ID="900", SLURM_CPUS_ON_NODE="8", **extra_env)
         r = subprocess.run(["bash", str(sp)], env=env, capture_output=True, text=True)
         return r.returncode, (calls.read_text().splitlines() if calls.exists() else [])
 
@@ -788,6 +1020,76 @@ def test_sbatch_scripts() -> None:
     for clash in ("904 arm1_s1 RUNNING", "905 arm1_s3 PENDING", "351837_0 arm1_sam RUNNING"):
         rc, py = run("arm1_merge.sbatch", clash + "\n")
         check(rc == 3 and not py, f"merge refuses to start while '{clash}'")
+
+    # ---- ViT-B (D32): own checkpoint, own folder, own names; never touches outputs/arm1
+    def limit_of(name):
+        return next(l_ for l_ in texts[name].splitlines() if l_.startswith("#SBATCH --time="))
+    for name, want in (("arm1_vitb.sbatch", "03:00:00"), ("arm1_vitb_shard0.sbatch", "02:00:00"),
+                       ("arm1_vitb_shard1.sbatch", "02:00:00"), ("arm1_vitb_merge.sbatch", "01:00:00")):
+        check(limit_of(name) == f"#SBATCH --time={want}", f"{name} has time limit {want}")
+    b_out, ref = f"--out {seg}/outputs/arm1_vit_b", seg / "outputs" / "arm1"
+    for name in ("arm1_vitb.sbatch", "arm1_vitb_shard0.sbatch", "arm1_vitb_shard1.sbatch",
+                 "arm1_vitb_merge.sbatch"):
+        check("sam_vit_b_01ec64.pth" in texts[name] and "sam_vit_h" not in texts[name]
+              and "OUT=$SEG/outputs/arm1_vit_b\n" in texts[name],
+              f"{name} uses only the ViT-B checkpoint and outputs/arm1_vit_b")
+
+    ref.mkdir(parents=True, exist_ok=True)
+    (ref / "run.json").write_text("{}")
+    rc, py = run("arm1_vitb.sbatch", "900 arm1b RUNNING\n999 arm1_s0 RUNNING\n")
+    ev = [c for c in py if "eval_sam.py" in c]
+    check(rc == 0 and len(ev) == 1 and "--model-type vit_b" in ev[0] and b_out in ev[0]
+          and ev[0].rstrip().endswith("--resume") and "sam_vit_b_01ec64.pth" in ev[0]
+          and "--shard" not in ev[0] and "--merge" not in ev[0],
+          "arm1_vitb.sbatch runs eval_sam.py --model-type vit_b --resume on outputs/arm1_vit_b "
+          "(and ignores unrelated ViT-H job names)")
+    agg = [c for c in py if "aggregate_arm.py" in c]
+    cmp_ = [c for c in py if "compare_arms.py" in c]
+    check(len(agg) == 1 and f"{seg}/outputs/arm1_vit_b" in agg[0] and "vit_b" in agg[0],
+          "then aggregates outputs/arm1_vit_b, labelled vit_b")
+    check(len(cmp_) == 1 and f"--a {ref}" in cmp_[0] and f"--b {seg}/outputs/arm1_vit_b" in cmp_[0],
+          "then compares ViT-B (B) against the ViT-H arm 1 (A)")
+    (ref / "run.json").unlink()
+    rc, py = run("arm1_vitb.sbatch", "")
+    check(rc == 0 and not any("compare_arms.py" in c for c in py)
+          and any("aggregate_arm.py" in c for c in py),
+          "without a ViT-H run.json the comparison is skipped, the job still succeeds")
+    for clash in ("901 arm1b PENDING", "902 arm1b_s0 RUNNING", "903 arm1b_merge PENDING",
+                  "904 arm1_sam RUNNING"):
+        rc, py = run("arm1_vitb.sbatch", clash + "\n")
+        check(rc == 3 and not py, f"arm1_vitb.sbatch refuses to start next to '{clash}'")
+
+    for k in range(2):
+        rc, py = run(f"arm1_vitb_shard{k}.sbatch", f"905 arm1b_s{1 - k} RUNNING\n")
+        ev = [c for c in py if "eval_sam.py" in c]
+        check(rc == 0 and len(ev) == 1 and f"--shard {k} --num-shards 2" in ev[0]
+              and "--model-type vit_b" in ev[0] and b_out in ev[0]
+              and not any("aggregate_arm.py" in c for c in py),
+              f"arm1_vitb_shard{k}.sbatch runs --shard {k} --num-shards 2 (ViT-B), alongside the other shard")
+        for clash in ("906 arm1b RUNNING", f"907 arm1b_s{k} PENDING", "908 arm1b_merge PENDING",
+                      "909 arm1_sam RUNNING"):
+            rc, py = run(f"arm1_vitb_shard{k}.sbatch", clash + "\n")
+            check(rc == 3 and not py, f"ViT-B shard {k} refuses to start next to '{clash}'")
+
+    (ref / "run.json").write_text("{}")
+    rc, py = run("arm1_vitb_merge.sbatch", "")
+    ev = [c for c in py if "eval_sam.py" in c]
+    check(rc == 0 and len(ev) == 1 and "--merge 2" in ev[0] and "--model-type vit_b" in ev[0]
+          and b_out in ev[0] and any("aggregate_arm.py" in c for c in py)
+          and any("compare_arms.py" in c for c in py),
+          "arm1_vitb_merge.sbatch runs --merge 2 (ViT-B), aggregates, compares")
+    for clash in ("910 arm1b_s0 RUNNING", "911 arm1b_s1 PENDING", "912 arm1b RUNNING"):
+        rc, py = run("arm1_vitb_merge.sbatch", clash + "\n")
+        check(rc == 3 and not py, f"ViT-B merge refuses to start while '{clash}'")
+
+    # ---- eval_sam.sbatch routes each model to its own folder
+    for env_, want in (({}, "arm1"), ({"MODEL": "vit_b"}, "arm1_vit_b"),
+                       ({"MODEL": "vit_b", "LIMIT": "2"}, "arm1_smoke_vit_b"),
+                       ({"LIMIT": "2"}, "arm1_smoke")):
+        rc, py = run("eval_sam.sbatch", "", **env_)
+        ev = [c for c in py if "eval_sam.py" in c]
+        check(rc == 0 and len(ev) == 1 and ev[0].split("--out ")[1].split()[0] == f"{seg}/outputs/{want}",
+              f"eval_sam.sbatch {env_ or '(defaults)'} writes to outputs/{want}")
 
 
 def test_python_compatibility() -> None:
@@ -813,6 +1115,8 @@ def main() -> int:
     test_aggregation()
     test_end_to_end()
     test_sharding()
+    test_model_stamp()
+    test_compare_arms()
     test_sbatch_scripts()
     print("\nALL TESTS PASSED")
     return 0

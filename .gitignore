@@ -27,3 +27,6 @@ work_dir/
 *.out
 *.err
 *.log
+
+# Arm-2 training runs (checkpoints, logs)
+runs/

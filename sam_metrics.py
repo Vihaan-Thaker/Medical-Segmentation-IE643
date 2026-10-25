@@ -185,6 +185,30 @@ def bootstrap_ci(values: list[float], n_boot: int = 10000, seed: int = 643,
             float(np.percentile(means, 100 * (1 - alpha / 2))))
 
 
+def paired_bootstrap_diff(a: list[float], b: list[float], n_boot: int = 10000, seed: int = 643,
+                          alpha: float = 0.05) -> tuple[float, float, float, float, float]:
+    """Compare two arms on the SAME patients. `a[i]` and `b[i]` are patient i's mean score
+    under arm A and arm B. Returns (mean A, mean B, mean of B - A, CI low, CI high), the CI
+    being a percentile bootstrap that resamples patients, i.e. pairs, so each patient's
+    own difficulty cancels out. Narrower than comparing two independent CIs."""
+    va, vb = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    if va.shape != vb.shape or va.ndim != 1:
+        raise MetricError(f"paired values must be two equal-length lists, got {va.shape} vs {vb.shape}")
+    if not (np.isfinite(va).all() and np.isfinite(vb).all()):
+        raise MetricError("paired values contain NaN/inf")
+    if va.size == 0:
+        nan = float("nan")
+        return nan, nan, nan, nan, nan
+    d = vb - va
+    if d.size == 1:
+        return float(va[0]), float(vb[0]), float(d[0]), float(d[0]), float(d[0])
+    rng = np.random.default_rng(seed)
+    means = d[rng.integers(0, d.size, size=(n_boot, d.size))].mean(axis=1)
+    return (float(va.mean()), float(vb.mean()), float(d.mean()),
+            float(np.percentile(means, 100 * alpha / 2)),
+            float(np.percentile(means, 100 * (1 - alpha / 2))))
+
+
 def aggregate_by_patient(rows: list[dict], metric: str, n_boot: int = 10000,
                          seed: int = 643) -> dict:
     """Mean within each patient, then across patients, with a bootstrap CI over patients.

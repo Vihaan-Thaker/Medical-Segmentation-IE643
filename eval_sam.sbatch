@@ -17,7 +17,8 @@
 #   full:   sbatch eval_sam.sbatch                         -> outputs/arm1
 #           (refused if outputs/arm1 already holds results -- use RESUME=1 or the shards)
 #   resume: sbatch --export=ALL,RESUME=1 eval_sam.sbatch   (continues an interrupted run)
-#   model:  sbatch --export=ALL,MODEL=vit_b eval_sam.sbatch
+#   model:  sbatch --export=ALL,MODEL=vit_b eval_sam.sbatch     -> outputs/arm1_vit_b
+#           (for ViT-B prefer the generated arm1_vitb.sbatch, D32)
 #
 # PARALLEL (D27) -- N GPUs at once, then one merge. Never shares a file between jobs.
 #   shards: sbatch --array=0-3 --export=ALL,SHARDS=4 eval_sam.sbatch
@@ -57,12 +58,17 @@ LIMIT=${LIMIT:-}
 RESUME=${RESUME:-}
 SHARDS=${SHARDS:-}
 MERGE=${MERGE:-}
+# One output folder per model (D32): ViT-H keeps outputs/arm1, others get outputs/arm1_<model>.
+# eval_sam.py's model stamp would refuse a mix anyway; this keeps them from ever meeting.
 if [ -n "$LIMIT" ]; then
     OUT=$SEG/outputs/arm1_smoke
     EXTRA="--limit $LIMIT"
 else
     OUT=$SEG/outputs/arm1
     EXTRA=""
+fi
+if [ "$MODEL" != "vit_h" ]; then
+    OUT=${OUT}_$MODEL
 fi
 [ -n "$RESUME" ] && EXTRA="$EXTRA --resume"
 if [ -n "$SHARDS" ] && [ -n "$MERGE" ]; then
