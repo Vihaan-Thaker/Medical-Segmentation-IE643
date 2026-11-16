@@ -12,7 +12,8 @@ whether that ability can be distilled into a small network that needs no prompt 
 | | Arm | Prompt | Status |
 |---|---|---|---|
 | 1 | Off-the-shelf SAM (ViT-H, zero-shot) | ground-truth box | **done** |
-| 2 | Fine-tuned SAM (the teacher) | ground-truth box | in progress |
+| 1b | Off-the-shelf SAM (ViT-B, zero-shot): same size as arm 2 | ground-truth box | ready to run |
+| 2 | Fine-tuned SAM ViT-B (the teacher): LoRA r = 4 and r = 8 on the encoder's q/v + full mask decoder | ground-truth box | code ready, training next |
 | 3 | Lightweight student trained from scratch | none | planned |
 | 4 | Lightweight student distilled from arm 2 | none | planned |
 | + | Cross-modality transfer (train on CT → test on MRI, and vice versa) | | planned |
@@ -137,10 +138,40 @@ Output: `manifest.csv` (one row per slice: split, boxes, areas, spacing, path), 
 | `sam_metrics.py` | Shared metrics: Dice, NSD (2D/3D), box jitter, box IoU, per-patient bootstrap, self-test |
 | `eval_sam.py` | Arm 1 evaluation: SAM with box prompts, resumable, shardable, self-verifying |
 | `aggregate_arm.py` | Per-instance scores → `summary.csv`, `breakdowns.csv`, `summary.md` |
-| `test_eval_sam.py` | 149 checks: metrics, jitter, aggregation, end-to-end with a stub SAM, resume, sharding, merge, SLURM scripts |
-| `eval_sam.sbatch` | SLURM job: one-job evaluation (also supports `RESUME=1`) |
-| `arm1_shard{0..3}.sbatch`, `arm1_merge.sbatch` | Four independent shard jobs plus a manual merge job |
-| `gen_sbatch.py` | Generates the shard and merge scripts from a single template |
+| `compare_arms.py` | Paired comparison of two runs kidney by kidney (B − A, paired bootstrap over patients). It first proves both runs used identical prompts. |
+| `test_eval_sam.py` | 235 checks: metrics, jitter, aggregation, end-to-end with a stub SAM, resume, sharding, merge, model stamp, paired comparison, SLURM scripts |
+| `eval_sam.sbatch` | SLURM job: one-job evaluation (`MODEL=`, `RESUME=1`); each model writes to its own folder |
+| `arm1_shard{0..3}.sbatch`, `arm1_merge.sbatch` | ViT-H: four independent shard jobs plus a manual merge job |
+| `arm1_vitb.sbatch` | ViT-B: one job that scores, aggregates and compares with ViT-H; always resumes |
+| `arm1_vitb_shard{0,1}.sbatch`, `arm1_vitb_merge.sbatch` | ViT-B fallback, only if one job cannot finish |
+| `gen_sbatch.py` | Generates all `arm1_*` and `arm2_*` scripts from a single template |
+| `sam_lora.py` | Arm 2: LoRA on q/v of every encoder block, freezing, frozen-weight digest, adapter save/load, merge into a plain checkpoint |
+| `sam_train_core.py` | Arm 2: batched forward identical to `SamPredictor` (per-image preprocess, per-box decode), losses, LR schedule, val selection score |
+| `train_data.py` | Arm 2: AMOS train/val slices exactly as arm 1 reads them, 50/50 CT/MRI draws, per-draw-seeded box jitter |
+| `train_sam_lora.py` | Arm 2: `--preflight`, resumable training, `--finalize` (merge + merge check), `--check-merged` |
+| `select_rank.py` | Arm 2: chooses r = 4 or r = 8 from AMOS-val only, refusing once any arm-2 test result exists |
+| `test_train_sam.py` | 125 CPU checks for arm 2 (tiny SAM + synthetic data), incl. forward == SamPredictor, resume exactness, the SLURM scripts |
+| `arm2_*.sbatch` | Preflight + training (A100, `dgx`), selection, evaluation (A40, as arm 1) and comparison |
+| `fetch_results.sh` | Copies only the small result files from Prajna into `IE643_Project/results/` (run on the Mac) |
+| `check_training.py` | Verifies both arm-2 training runs and the rank selection; writes `training_summary.md` |
+| `results_table.py` | One cross-checked table across arms 1, 1b, 2 r4, 2 r8 → `arms_summary.md` / `.csv` |
+| `plot_results.py` | Report figures: training curves, Dice vs jitter, per-patient Δ, gain per dataset |
+| `post_common.py`, `test_post.py` | Shared stdlib-only loaders/validation; 43 tests for the post-processing |
+| `student_unet.py` | Arms 3–4: prompt-free 2D U-Net (nnU-Net blocks, 7 levels, 16→256 channels, 8.37M parameters, deep supervision) |
+| `student_core.py` | Students' shared contract: letterbox to 512, global normalisation, box channels, back-mapping to the native slice, CE + batch Dice, poly LR, validation metric |
+| `student_aug.py` | nnU-Net v2 augmentations, deterministic per draw; no mirroring, rotation ≤ ±30° (left/right kidney labels) |
+| `student_data.py` | All AMOS train/val band slices in RAM (integrity-checked), 50/50 CT/MRI draws, train/val datasets |
+| `train_student.py` | Arms 3–4: `--preflight`, resumable training with run stamp, per-epoch AMOS-val selection; `--kd ...` adds arm 4's distillation term (refuses unless paired with the same-seed arm-3 run) |
+| `gen_sbatch_arm3.py`, `arm3_*.sbatch` | Arm-3 SLURM scripts: preflight + two training jobs (two runs each), A100 |
+| `test_student.py` | CPU tests for arm 3 (synthetic data): architecture, letterbox, augmentation, losses, data, resume, stamp, preflight, SLURM |
+| `teacher_maps.py`, `teacher_io.py` | Arm 4: the r4 teacher's per-kidney logits on every boxed AMOS train slice (arm 2's exact evaluation path, clean boxes), float16 at native size; `teacher_io` is SAM-free |
+| `gen_sbatch_arm4.py`, `teacher_maps.sbatch`, `test_teacher.py` | Arm-4 SLURM script (A40) and its tests |
+| `student_kd.py` | Arm 4: verified in-RAM teacher store, network-frame teacher targets (they follow the augmentation's own geometry), region = clean box + 20%, and the distillation loss (per-kidney binary KL, T, x T², ÷ batch) |
+| `arm3_reference.py`, `frozen_arm3/` | Byte copies of the 7 arm-3 code files and a runner that executes them in a separate process: proves the changed code reproduces arm 3 bit for bit with distillation off |
+| `gen_sbatch_arm4_train.py`, `arm4_preflight.sbatch`, `arm4_train_s643/s644/s645.sbatch`, `test_arm4.py` | Arm-4 training scripts (A100; preflight + one run per seed, in parallel) and their tests |
+| `eval_student.py` | Arms 3–4 test evaluation: same 13,145 instances and output format as `eval_sam.py` (whose verification/resume it imports); plain students also get whole-volume 3D and the false-positive rate on kidney-free slices |
+| `seed_summary.py` | Mean ± SD over the plain-student seeds and the seed-averaged paired comparison vs a reference arm |
+| `gen_sbatch_arm3_eval.py`, `arm3_eval_a/b.sbatch`, `arm3_compare.sbatch`, `test_student_eval.py` | Arm-3 evaluation scripts (A40) and their tests |
 
 ## Setup
 
@@ -198,7 +229,55 @@ Each shard scores a slice-balanced quarter of the unfinished cases and writes on
 folder. The merge combines everything, re-verifies it and aggregates. A full ViT-H pass takes about
 0.7 s per slice on one A40, so about 1.5 h for all 7,386 slices.
 
-**Outputs** (`outputs/arm1/`):
+**3c. Arm 1b (ViT-B), one job**
+```bash
+sbatch arm1_vitb.sbatch            # -> outputs/arm1_vit_b, then compare_vs_arm1/compare.md
+```
+It uses the same boxes as the ViT-H run, because the jitter is seeded per kidney. Before
+reporting any difference, `compare_arms.py` verifies this on every row.
+
+**4. Arm 2: fine-tune SAM ViT-B** (train on A100s, evaluate on A40s like arm 1)
+```bash
+sbatch arm2_preflight.sbatch                     # PREFLIGHT_OK; sets batch/time in gen_sbatch.py
+sbatch arm2_r4_train.sbatch; sbatch arm2_r8_train.sbatch        # TRAIN_OK + FINALIZE_OK each
+sbatch arm2_select.sbatch                        # SELECT_OK: rank chosen on AMOS val only
+sbatch arm2_r4_eval.sbatch; sbatch arm2_r8_eval.sbatch          # EVAL_OK + compare vs arm 1b
+sbatch arm2_compare.sbatch                       # r4 vs r8 on identical prompts
+```
+**4b. Arm 3: prompt-free student from scratch** (A100; four runs in two jobs)
+```bash
+python test_student.py                           # ALL TESTS PASSED
+sbatch arm3_preflight.sbatch                     # PREFLIGHT_OK; set ARM3_TRAIN_TIME, regenerate
+sbatch arm3_train_a.sbatch; sbatch arm3_train_b.sbatch   # TRAIN_OK x 2 each
+```
+Recipe = nnU-Net v2 (SGD 0.01, Nesterov 0.99, poly, CE + Dice with deep supervision), batch 12,
+100 epochs x 1,000 steps on all AMOS train band slices (14,475), best epoch on AMOS val.
+Runs: box-free student, seeds 643/644/645; box-input variant (image + right/left box channels), seed 643.
+Test evaluation (A40): `sbatch arm3_eval_a.sbatch; sbatch arm3_eval_b.sbatch`, then `sbatch arm3_compare.sbatch`
+(seed summary vs arm 1b and arm 2 r4; box vs plain on the same seed).
+
+Arm 4 (distilled student, ARM4_CODE_PLAN.md): the plain student + λ·KL to the arm-2 r4 teacher's
+stored maps (T = 1, λ = 1, region = clean box + 20%, teacher Dice < 0.80 gated), seeds 643/644/645,
+each paired with the arm-3 run of the same seed (same draws, augmentation, initial weights).
+```bash
+python test_arm4.py                              # ALL TESTS PASSED
+sbatch arm4_preflight.sbatch                     # PREFLIGHT_OK; set ARM4_TRAIN_TIME, regenerate
+sbatch arm4_train_s643.sbatch; sbatch arm4_train_s644.sbatch; sbatch arm4_train_s645.sbatch
+```
+
+**5. Results package (on the Mac, ordinary Python; no GPU, no cluster compute)**
+```bash
+bash fetch_results.sh --with-instances           # small files only -> ../results/
+python check_training.py --results ../results    # POST_OK: both runs + selection verified
+python results_table.py  --results ../results    # ../results/arms_summary.md + .csv
+python plot_results.py   --results ../results    # ../results/figures/*.png
+```
+
+Training: AMOS train (8,295 boxed slices, 50/50 CT/MRI draws), box jitter 0-20%, soft Dice +
+BCE + IoU-head MSE, AdamW (LoRA 5e-4, decoder 1e-4), warm-up + cosine, 35 epochs. The best
+epoch is chosen on AMOS val. The test sets are never touched until the evaluation scripts run.
+
+**Outputs** (`outputs/arm1/`; ViT-B in `outputs/arm1_vit_b/`):
 - `instances.csv`: one row per kidney × jitter level, holding the boxes, Dice, NSD at every
   tolerance, and SAM's predicted IoU;
 - `volumes_3d.csv`: one row per kidney volume × jitter level;
@@ -224,14 +303,19 @@ A long GPU job must not silently corrupt a result, so `eval_sam.py` checks the f
   the same files.
 - **QC overlays** re-run SAM on the worst and median instances. The re-run Dice must match the
   stored value, which is a cross-job reproducibility check: the arm 1 run reproduced to 5 × 10⁻⁷.
+- **Model stamp:** each results folder holds `model.json` (model type, plus the checkpoint's
+  name, size and sha256). Resume, shard and merge refuse a folder produced by a different
+  model or checkpoint. This matters because boxes and areas are the same for every model, so
+  the row checks alone could not tell a ViT-H row from a ViT-B row.
 - `aggregate_arm.py` only summarises results that `run.json` certifies as complete.
+- `compare_arms.py` refuses unless both runs are certified and every pair matches on key, box,
+  jittered box, ground-truth area and spacing.
 
 ## Roadmap
 
-- **Arm 2:** fine-tune SAM on the AMOS training split (Dice + BCE, AdamW), with box jitter in
-  training aimed at the 20% robustness cliff. The checkpoint is chosen on AMOS validation.
-  Reference recipe: MedSAM.
-- **Arms 3–4:** a lightweight prompt-free student, trained from scratch and distilled from arm 2.
+- **Arm 2:** run the training (code ready: LoRA r = 4 and r = 8 on SAM ViT-B, plus the decoder).
+- **Arm 3:** run the training (code ready: 8.37M-parameter 2D U-Net, three seeds + a box-input variant).
+- **Arm 4:** the same student distilled from the arm-2 teacher (same seeds: paired with arm 3).
 - **Cross-modality transfer:** CT-only and MRI-only training, tested on the other modality.
 
 ## References

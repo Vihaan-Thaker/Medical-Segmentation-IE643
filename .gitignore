@@ -30,3 +30,8 @@ work_dir/
 
 # Arm-2 training runs (checkpoints, logs)
 runs/
+
+# Demo: sample scans (dataset files, not redistributable), weights and outputs stay local
+demo/samples/
+demo/weights/
+demo/results/

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CPU tests for the arm-4 training code (ARM4_CODE_PLAN.md §12).
+"""CPU tests for the arm-4 training code and its evaluation (ARM4_CODE_PLAN.md §12; Part B = 15).
 
     python test_arm4.py        # exits 0 and prints ALL TESTS PASSED
 
@@ -549,6 +549,194 @@ def test_sbatch(tmp: Path) -> None:
     check(rc == 2 and not argv, "missing teacher maps stop the script before python")
 
 
+def make_kd_run(root: Path, proc: Path, exp: dict, va, seed: int) -> Path:
+    """A finished arm-4 training folder: test_student_eval's run fixture with different weights
+    (made under seed + 1000, then re-labelled), plus run.json's kd block and teacher identity."""
+    import eval_student as ES
+    import test_student_eval as TSE
+    src = TSE.make_run(root / "kdsrc", proc, exp, va, "plain", seed + 1000)
+    ck = torch.load(src / "best.pt", map_location="cpu", weights_only=False)
+    ck["seed"] = seed
+    torch.save(ck, src / "best.pt")
+    rj = json.loads((src / "run.json").read_text())
+    rj.update(seed=seed, best_sha256=ES.sha256_file(src / "best.pt"), arm=4,
+              kd={"lambda": 1.0, "temperature": 1.0, "margin": 0.2, "gate": 0.8},
+              teacher={"teacher_sha256": TM.TEACHER_SHA256, "manifest_sha256": D.manifest_sha256(proc)})
+    (src / "run.json").write_text(json.dumps(rj))
+    dst = root / "runs" / f"arm4_plain_s{seed}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    return dst
+
+
+def test_part_b(tmp: Path) -> None:
+    print("\n--- 15. Part B: evaluation of arm 4 ---")
+    import eval_sam as E
+    import eval_student as ES
+    import seed_summary as SS
+    import test_student_eval as TSE
+    root = tmp / "partb"
+    old_cases, old_groups = TS.CASES, dict(E.EXPECTED_GROUPS)
+    try:
+        proc, exp, rows, cases, va = TSE.setup(root)
+        kd = {s: make_kd_run(root, proc, exp, va, s) for s in (643, 644)}
+        a3 = {s: TSE.make_run(root, proc, exp, va, "plain", s) for s in (643, 644)}
+
+        tr = ES.check_training(kd[643], proc)
+        check(tr["ident"]["model_type"] == "student_plain_kd"
+              and tr["ident"]["checkpoint_name"] == "arm4_plain_s643/best.pt",
+              "check_training accepts arm4_plain_s643: model type student_plain_kd")
+        check(ES.check_training(a3[643], proc)["ident"]["model_type"] == "student_plain",
+              "an arm-3 run is unchanged: student_plain")
+
+        def refused(mutate, folder: str, why: str, msg: str) -> None:
+            d = root / "bad" / folder
+            shutil.rmtree(d.parent, ignore_errors=True)
+            shutil.copytree(kd[643], d)
+            rj = json.loads((d / "run.json").read_text())
+            mutate(rj)
+            (d / "run.json").write_text(json.dumps(rj))
+            try:
+                quiet(ES.check_training, d, proc)
+                check(False, msg)
+            except SystemExit as e:
+                check(why in str(e), msg + f" ({str(e)[:90]})" if why not in str(e) else msg)
+        refused(lambda rj: None, "arm3_plain_s643", "does not match", "refuses a distilled run in an arm3_ folder")
+        refused(lambda rj: rj.pop("kd"), "arm4_plain_s643", "does not match", "refuses an arm4_ folder without a kd block")
+        refused(lambda rj: rj["kd"].pop("gate"), "arm4_plain_s643", "kd block incomplete", "refuses an incomplete kd block")
+        refused(lambda rj: rj["teacher"].update(teacher_sha256="0" * 64), "arm4_plain_s643", "teacher_sha256",
+                "refuses a run distilled from another teacher")
+
+        out4 = {s: root / "outputs" / f"arm4_plain_s{s}" for s in kd}
+        out3 = {s: root / "outputs" / f"arm3_plain_s{s}" for s in a3}
+        for s in kd:
+            rc4, _ = TSE.evaluate(proc, kd[s], out4[s], exp)
+            rc3, _ = TSE.evaluate(proc, a3[s], out3[s], exp)
+            check(rc4 == 0 and rc3 == 0, f"seed {s}: arm-4 and arm-3 evaluations end EVAL_OK")
+        ej = json.loads((out4[643] / "run.json").read_text())
+        check(ej["model"]["model_type"] == "student_plain_kd" and ej["kd"]["gate"] == 0.8 and ej["arm"] == 4
+              and ej["teacher_sha256"] == TM.TEACHER_SHA256 and "kd" not in json.loads((out3[643] / "run.json").read_text()),
+              "eval run.json records the kd settings (arm 4 only)")
+        i4, i3 = TSE.read(out4[643] / "instances.csv"), TSE.read(out3[643] / "instances.csv")
+        keys = ("case", "z", "side", "jitter", "box_clean", "box_jit")
+        check([[r[k] for k in keys] for r in i4] == [[r[k] for k in keys] for r in i3]
+              and any(a["dice"] != b["dice"] for a, b in zip(i4, i3)),
+              "arm 4 is scored on the identical instances and boxes as arm 3 (with different predictions)")
+
+        so = root / "outputs" / "arm4_seeds"
+        argv = ["--runs", str(out4[643]), str(out4[644]), "--ref-runs", str(out3[644]), str(out3[643]),
+                "--label-ref", "Arm 3 plain student", "--out", str(so), "--n-boot", "200"]
+        rc, log = quiet(SS.main, argv)
+        check(rc == 0 and "SUMMARY_OK" in log and "# Arm 4 distilled plain student" in log and "Seed-paired" in log,
+              "seed_summary --ref-runs: SUMMARY_OK, arm-4 title")
+        t2 = [r for r in TSE.read(so / "seed_compare_vs_arm_3_plain_student.csv")
+              if r["level"] == "2d" and r["metric"] == "dice" and abs(float(r["jitter"]) - 0.10) < 1e-9]
+
+        def pmeans(o: Path) -> dict:
+            acc: dict = {}
+            for r in TSE.read(o / "instances.csv"):
+                if abs(float(r["jitter"]) - 0.10) < 1e-9:
+                    g = "/".join(x for x in (r["dataset"], r["modality"], r["sequence"]) if x)
+                    acc.setdefault(g, {}).setdefault(r["patient"], []).append(float(r["dice"]))
+            return {g: {p_: sum(v) / len(v) for p_, v in d.items()} for g, d in acc.items()}
+        p4, p3 = {s: pmeans(out4[s]) for s in kd}, {s: pmeans(out3[s]) for s in a3}
+        ok = bool(t2)
+        for row in t2:
+            g = row["group"]
+            pats = sorted(p3[643][g])
+            ref = [(p3[643][g][q] + p3[644][g][q]) / 2 for q in pats]
+            stu = [(p4[643][g][q] + p4[644][g][q]) / 2 for q in pats]
+            ok &= abs(float(row["ref_mean"]) - round(sum(ref) / len(ref), 4)) < 1e-9
+            ok &= abs(float(row["delta"]) - round(sum(b - a for a, b in zip(ref, stu)) / len(pats), 4)) < 1e-9
+            for s in kd:     # each seed against its OWN partner, not the seed-mean reference
+                want = sum(p4[s][g][q] - p3[s][g][q] for q in pats) / len(pats)
+                ok &= abs(float(row[f"delta_arm4_plain_s{s}"]) - round(want, 4)) < 1e-9
+        check(ok, "--ref-runs: reference = mean over arm-3 seeds, Δ and per-seed Δ (vs own partner) = hand computation")
+        rc, log = quiet(SS.main, ["--runs", str(out4[643]), str(out4[644]), "--ref-runs", str(out3[643]),
+                                  "--out", str(so), "--n-boot", "50"])
+        check(rc == 1 and "seed sets must be identical" in log, "--ref-runs refuses mismatched seed sets")
+        rc, log = quiet(SS.main, ["--runs", str(out4[643]), str(out3[644]), "--ref-runs", str(out3[643]), str(out4[644]),
+                                  "--out", str(so), "--n-boot", "50"])
+        check(rc == 1 and "plain student, all of one type" in log, "refuses arm-3 and arm-4 runs mixed as seeds")
+        rc, log = quiet(SS.main, ["--runs", str(out4[643]), str(out4[644]), "--ref", str(out3[643]),
+                                  "--out", str(so), "--n-boot", "50"])
+        check(rc == 0 and (so / "seed_summary_vs_arm3_plain_s643.md").read_text().startswith("# Arm 4 distilled"),
+              "--ref mode works on arm-4 seeds (single reference)")
+    finally:
+        TS.CASES = old_cases
+        E.EXPECTED_GROUPS = old_groups
+
+
+def test_eval_sbatch(tmp: Path) -> None:
+    print("\n--- 15b. arm-4 evaluation SLURM scripts ---")
+    names = ["arm4_compare.sbatch", "arm4_eval_a.sbatch", "arm4_eval_b.sbatch"]
+    regen = tmp / "regen_eval"
+    regen.mkdir()
+    subprocess.run([sys.executable, str(HERE / "gen_sbatch_arm4_eval.py"), str(regen)], check=True, capture_output=True)
+    check(sorted(p.name for p in regen.glob("*.sbatch")) == names, "generator writes exactly the 3 evaluation scripts")
+    for n in names:
+        txt = (HERE / n).read_text()
+        check(txt == (regen / n).read_text() and subprocess.run(["bash", "-n", str(HERE / n)]).returncode == 0
+              and "#SBATCH --partition=a40" in txt and "*A40*" in txt, f"{n}: == generator, bash -n, a40/A40")
+    stub, calls = tmp / "stub_eval", tmp / "calls_eval.txt"
+    stub.mkdir()
+    (stub / "squeue").write_text('#!/bin/bash\necho "${SQUEUE_OUT:-}"\n')
+    (stub / "nvidia-smi").write_text('#!/bin/bash\necho "${GPU_NAME:-NVIDIA A40}"\n')
+    (stub / "py").write_text('#!/bin/bash\nif [ "$1" = "-c" ]; then echo env-ok; exit 0; fi\n'
+                             f'echo "$@" >> {calls}\n'
+                             'if [ -n "${FAIL_MATCH:-}" ] && echo "$@" | grep -q -- "$FAIL_MATCH"; then exit 7; fi\nexit 0\n')
+    for f in stub.iterdir():
+        f.chmod(f.stat().st_mode | stat.S_IEXEC)
+    seg = tmp / "seg_eval"
+    (seg / "data/processed").mkdir(parents=True)
+    (seg / "data/processed/manifest.csv").write_text("x\n")
+    for d in ("arm1_vit_b", "arm2_r4", "arm3_plain_s643", "arm3_plain_s644", "arm3_plain_s645"):
+        (seg / "outputs" / d).mkdir(parents=True)
+        (seg / "outputs" / d / "run.json").write_text("{}")
+
+    def run(name, **env):
+        t = (HERE / name).read_text().replace("SEG=/home/rethinkingai-self/vihaan/Segmentation", f"SEG={seg}")
+        t = t.replace("PY=/home/rethinkingai-self/vihaan/miniconda3/envs/seg311/bin/python", f"PY={stub / 'py'}")
+        sp = tmp / "run_eval.sh"
+        sp.write_text(t)
+        calls.unlink(missing_ok=True)
+        r = subprocess.run(["bash", str(sp)], env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}", **env},
+                           capture_output=True, text=True)
+        return r.returncode, (calls.read_text().splitlines() if calls.exists() else []), r.stdout
+    rc, cl, _ = run("arm4_eval_a.sbatch")
+    steps = [c.split()[0].rsplit("/", 1)[-1] for c in cl]
+    check(rc == 0 and steps == ["eval_student.py", "aggregate_arm.py"] + ["compare_arms.py"] * 3
+          + ["eval_student.py", "aggregate_arm.py"] + ["compare_arms.py"] * 3
+          and f"{seg}/runs/arm4_plain_s643" in cl[0] and "--resume" in cl[0] and "--expect-gpu A40" in cl[0]
+          and f"--a {seg}/outputs/arm3_plain_s643 --b {seg}/outputs/arm4_plain_s643" in cl[4]
+          and f"{seg}/runs/arm4_plain_s644" in cl[5] and f"--a {seg}/outputs/arm3_plain_s644" in cl[9],
+          "eval_a: s643 then s644, each vs arm 1b, arm 2 and its own arm-3 seed")
+    rc, cl, _ = run("arm4_eval_b.sbatch")
+    check(rc == 0 and len(cl) == 5 and f"{seg}/runs/arm4_plain_s645" in cl[0] and "arm3_plain_s645" in cl[-1],
+          "eval_b: s645 vs arm 1b, arm 2 and arm-3 s645")
+    rc, cl, out = run("arm4_eval_a.sbatch", FAIL_MATCH="arm4_plain_s643 --out")
+    check(rc == 7 and len(cl) == 1 and "STOPPING" in out, "a failing evaluation stops the script")
+    rc, cl, out = run("arm4_eval_a.sbatch", FAIL_MATCH="--a .*arm3_plain_s643")
+    check(rc == 5 and sum("eval_student.py" in c for c in cl) == 2 and "a comparison FAILED" in out,
+          "a failing comparison: next seed still evaluated, exit 5")
+    rc, cl, _ = run("arm4_compare.sbatch")
+    check(rc == 0 and len(cl) == 3 and all("seed_summary.py" in c for c in cl) and "--ref-runs" in cl[2]
+          and all(f"arm4_plain_s{s}" in cl[2] and f"arm3_plain_s{s}" in cl[2] for s in SEEDS_EVAL)
+          and "outputs/arm4_seeds" in cl[2], "compare: vs arm 1b, vs arm 2, then seed-paired vs arm 3")
+    for job in ("arm4_t644", "arm4_ea"):
+        rc, cl, _ = run("arm4_eval_a.sbatch", SQUEUE_OUT=f"9 {job} RUNNING")
+        check(rc == 3 and not cl, f"evaluation refused next to {job}")
+    rc, cl, _ = run("arm4_eval_a.sbatch", SQUEUE_OUT="9 arm4_eb RUNNING")
+    check(rc == 0 and cl, "the two evaluation scripts may run together")
+    rc, cl, _ = run("arm4_compare.sbatch", SQUEUE_OUT="9 arm4_eb RUNNING")
+    check(rc == 3 and not cl, "compare refused while an evaluation runs")
+    rc, cl, _ = run("arm4_eval_b.sbatch", GPU_NAME="NVIDIA A100-SXM4-80GB")
+    check(rc == 4 and not cl, "non-A40 node refused")
+
+
+SEEDS_EVAL = (643, 644, 645)
+
+
 def test_isolation() -> None:
     print("\n--- 16. isolation, Python 3.10 compile ---")
     code = ("import sys; sys.path.insert(0, %r); import train_student, student_data; "
@@ -557,7 +745,8 @@ def test_isolation() -> None:
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     check(r.returncode == 0 and r.stdout.strip() == "[]", "arm-3 imports load no arm-4 / SAM module (import graph unchanged)")
     py310 = Path("/opt/anaconda3/envs/ner_env/bin/python")
-    files = ["student_kd.py", "student_data.py", "train_student.py", "arm3_reference.py", "gen_sbatch_arm4_train.py", "test_arm4.py"]
+    files = ["student_kd.py", "student_data.py", "train_student.py", "arm3_reference.py", "gen_sbatch_arm4_train.py",
+             "test_arm4.py", "eval_student.py", "seed_summary.py", "gen_sbatch_arm4_eval.py"]
     if py310.exists():
         r = subprocess.run([str(py310), "-m", "py_compile", *[str(HERE / f) for f in files]], capture_output=True, text=True)
         check(r.returncode == 0, f"all arm-4 files compile under Python 3.10 {r.stderr.strip()}")
@@ -588,6 +777,8 @@ def main() -> int:
         test_config_and_training(proc, exp, tmp, (tr, va), tdir, partner)
         test_preflight(proc, exp, tmp, (tr, va), tdir, partner)
         test_sbatch(tmp)
+        test_part_b(tmp)
+        test_eval_sbatch(tmp)
         test_isolation()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

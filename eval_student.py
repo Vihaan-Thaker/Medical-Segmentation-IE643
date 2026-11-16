@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 """Arms 3-4: score a trained student on the test + external sets (ARM3_EVAL_PLAN.md, D53).
+Arm 4 (ARM4_CODE_PLAN.md §11): an arm4_plain_s<seed> run (run.json with a kd block and the
+selected teacher's sha256) is evaluated exactly like a plain arm-3 student; its model type is
+student_plain_kd and the eval run.json records the kd settings.
 
     python eval_student.py --processed P --run-dir runs/arm3_plain_s643 \
                            --out outputs/arm3_plain_s643 --expect-gpu A40 --resume
@@ -85,9 +88,19 @@ def check_training(run_dir: Path, processed: Path) -> dict:
         problems.append(f"run.json status {rj.get('status')!r}, not TRAIN_OK")
     if rj.get("epochs_completed") != rj.get("settings", {}).get("epochs"):
         problems.append(f"{rj.get('epochs_completed')} epochs completed of {rj.get('settings', {}).get('epochs')}")
-    want_name = f"arm3_{rj.get('variant')}_s{rj.get('seed')}"
+    kd = rj.get("kd")               # arm 4 (distilled) runs carry a kd block; arm 3 runs have none
+    want_name = f"{'arm4' if kd else 'arm3'}_{rj.get('variant')}_s{rj.get('seed')}"
     if run_dir.name != want_name:
         problems.append(f"folder {run_dir.name!r} does not match variant/seed {want_name!r}")
+    if kd is not None:
+        import teacher_maps as TM   # local: arm-3 evaluations never load it
+        if rj.get("variant") != "plain":
+            problems.append(f"a distilled run must be a plain student, got {rj.get('variant')!r}")
+        if not isinstance(kd, dict) or set(kd) != {"lambda", "temperature", "margin", "gate"} \
+                or any(not isinstance(v, (int, float)) for v in kd.values()):
+            problems.append(f"run.json kd block incomplete: {kd!r}")
+        if (rj.get("teacher") or {}).get("teacher_sha256") != TM.TEACHER_SHA256:
+            problems.append("run.json teacher_sha256 is not the selected arm-2 teacher's")
     sha = sha256_file(best)
     if sha != rj.get("best_sha256"):
         problems.append(f"best.pt sha256 {sha[:16]}... != run.json best_sha256 {str(rj.get('best_sha256'))[:16]}...")
@@ -96,7 +109,8 @@ def check_training(run_dir: Path, processed: Path) -> dict:
         problems.append("the manifest changed since training (sha256 differs)")
     if problems:
         raise SystemExit(f"REFUSING -- {run_dir}: " + "; ".join(problems))
-    ident = {"model_type": f"student_{rj['variant']}", "checkpoint_name": f"{run_dir.name}/best.pt",
+    ident = {"model_type": f"student_{rj['variant']}{'_kd' if kd is not None else ''}",
+             "checkpoint_name": f"{run_dir.name}/best.pt",
              "checkpoint_bytes": best.stat().st_size, "checkpoint_sha256": sha}
     return {"rj": rj, "ident": ident}
 
@@ -578,7 +592,9 @@ def run(args, model_factory=None, val_expected_counts=D.EXPECTED_COUNTS) -> int:
             "fp_kidney_free_slices": fp_by_group, "speed": speed,
             "elapsed_min_this_run": round(elapsed / 60, 2),
             "seconds_by_stage": {k: round(v, 2) for k, v in stage.items()},
-            "qc_overlays": n_qc, "qc_max_dice_diff": qc_diff, "problems": problems}, fh, indent=2, default=str)
+            "qc_overlays": n_qc, "qc_max_dice_diff": qc_diff, "problems": problems,
+            **({"arm": 4, "kd": rj["kd"], "teacher_sha256": rj["teacher"]["teacher_sha256"]}
+               if rj.get("kd") is not None else {})}, fh, indent=2, default=str)
     if problems:
         log("\nPROBLEMS:")
         for m in problems:
