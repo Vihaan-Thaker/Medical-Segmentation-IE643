@@ -140,9 +140,16 @@ def dice_bool(pred: np.ndarray, gt: np.ndarray) -> float:
     return M.dice_coefficient(np.asarray(gt, bool), np.asarray(pred, bool))
 
 
-def val_metric(rows: list[dict], levels=(0.0, 0.10), select_level: float = 0.10) -> dict:
+def val_metric(rows: list[dict], levels=(0.0, 0.10), select_level: float = 0.10,
+               modalities: tuple = ("ct", "mri")) -> dict:
     """rows: {modality, patient, level, dice}. Per (modality, level): mean within each
-    patient, then over patients. Selection score = mean(CT, MRI) at select_level."""
+    patient, then over patients. Selection score = mean(CT, MRI) at select_level; for a
+    single-modality teacher (D71, modalities=("ct",) or ("mri",)) that modality's score. Rows
+    of any modality outside `modalities` are refused."""
+    present = {r["modality"] for r in rows}
+    extra = sorted(present - set(modalities))
+    if extra:
+        raise ValueError(f"val_metric: rows of {extra}, expected only {list(modalities)}")
     by: dict = defaultdict(lambda: defaultdict(list))
     for r in rows:
         by[(r["modality"], round(float(r["level"]), 4))][r["patient"]].append(float(r["dice"]))
@@ -152,9 +159,14 @@ def val_metric(rows: list[dict], levels=(0.0, 0.10), select_level: float = 0.10)
         out[f"{mod}@{lev:.2f}"] = sum(pm) / len(pm)
         out[f"n_patients_{mod}@{lev:.2f}"] = len(pm)
         out[f"n_inst_{mod}@{lev:.2f}"] = sum(len(v) for v in pats.values())
-    need = [f"{m}@{round(select_level, 4):.2f}" for m in ("ct", "mri")]
+    need = [f"{m}@{round(select_level, 4):.2f}" for m in modalities]
     missing = [k for k in need if k not in out]
     if missing:
         raise ValueError(f"val_metric: no rows for {missing}")
-    out["selection"] = (out[need[0]] + out[need[1]]) / 2.0
+    if len(need) == 2:
+        out["selection"] = (out[need[0]] + out[need[1]]) / 2.0
+    elif len(need) == 1:
+        out["selection"] = out[need[0]]
+    else:
+        raise ValueError(f"val_metric: modalities must be one or two, got {list(modalities)}")
     return out

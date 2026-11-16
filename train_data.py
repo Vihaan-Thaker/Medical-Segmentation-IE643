@@ -10,6 +10,8 @@
   r4 and r8 runs see identical prompts regardless of worker count or batch size.
 * Epoch draws are made explicitly in the main process as (draw index, slice index) pairs:
   50/50 CT/MRI in expectation, with replacement.
+* Single-modality teachers (D70-D71): a dataset restricted to one modality draws uniformly
+  over its slices instead; the joint (both-modality) path is unchanged.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ TRAIN_SPLITS = ("train", "val")
 EXPECTED_SLICES = {"train": {"ct": 5760, "mri": 2535}, "val": {"ct": 1901, "mri": 843}}
 VAL_LEVELS = (0.0, 0.10)
 TRAIN_MAX_LEVEL = 0.20
+MODALITIES = ("ct", "mri")
 
 
 def check_split_integrity(processed: Path) -> dict:
@@ -61,13 +64,18 @@ def kidney_sides(row: dict) -> list[tuple[int, str]]:
 
 
 class SliceDataset:
-    """The boxed slices of one split, sorted by (case, z). Loads one slice on demand."""
+    """The boxed slices of one split, sorted by (case, z). Loads one slice on demand.
+    modality=None keeps both modalities (arm 2); "ct" / "mri" keeps that one only (D71)."""
 
-    def __init__(self, processed: Path, split: str, expected: dict | None = EXPECTED_SLICES):
+    def __init__(self, processed: Path, split: str, expected: dict | None = EXPECTED_SLICES,
+                 modality: str | None = None):
         if split not in TRAIN_SPLITS:
             raise ValueError(f"arm-2 data may only use {TRAIN_SPLITS}, not {split!r}")
+        if modality is not None and modality not in MODALITIES:
+            raise ValueError(f"modality must be None or one of {MODALITIES}, not {modality!r}")
         self.processed = Path(processed)
         self.split = split
+        self.modality = modality
         rows = E.load_manifest(self.processed, splits=(split,))
         bad = [r for r in rows if r["split"] != split]
         if bad:
@@ -77,10 +85,16 @@ class SliceDataset:
         for r in rows:
             if not kidney_sides(r):
                 raise AssertionError(f"{r['case']} z={r['z']}: sam_eligible but no side has a box")
+        if modality is not None:
+            rows = [r for r in rows if r["modality"] == modality]
         counts = dict(Counter(r["modality"] for r in rows))
-        if expected is not None and counts != expected[split]:
+        if modality is not None and set(counts) != {modality}:
+            raise SystemExit(f"{split} restricted to {modality}: modalities present {counts}")
+        want = None if expected is None else (
+            expected[split] if modality is None else {modality: expected[split][modality]})
+        if want is not None and counts != want:
             raise SystemExit(f"{split}: boxed slices per modality {counts} != expected "
-                             f"{expected[split]} (D33)")
+                             f"{want} (D33)")
         self.rows = rows
         self.counts = counts
 
@@ -112,12 +126,19 @@ class SliceDataset:
 
 def make_epoch_draws(ds: SliceDataset, epoch: int, seed: int, n_draws: int | None = None) -> list:
     """This epoch's training draws as [(i, slice_index)]: with replacement, weight 1/n_ct per
-    CT slice and 1/n_mri per MRI slice (50/50 in expectation). Deterministic in (seed, epoch)."""
+    CT slice and 1/n_mri per MRI slice (50/50 in expectation). A single-modality dataset
+    (D71) draws uniformly over its slices. Deterministic in (seed, epoch)."""
     n_draws = len(ds) if n_draws is None else n_draws
     n_mod = Counter(r["modality"] for r in ds.rows)
-    if set(n_mod) != {"ct", "mri"}:
-        raise ValueError(f"need both modalities to balance, have {dict(n_mod)}")
-    w = torch.tensor([1.0 / n_mod[r["modality"]] for r in ds.rows], dtype=torch.float64)
+    single = getattr(ds, "modality", None)
+    if single is None:
+        if set(n_mod) != {"ct", "mri"}:
+            raise ValueError(f"need both modalities to balance, have {dict(n_mod)}")
+        w = torch.tensor([1.0 / n_mod[r["modality"]] for r in ds.rows], dtype=torch.float64)
+    else:
+        if set(n_mod) != {single}:
+            raise ValueError(f"{single} dataset holds {dict(n_mod)}")
+        w = torch.ones(len(ds.rows), dtype=torch.float64)
     g = torch.Generator().manual_seed(int(seed) + int(epoch))
     idx = torch.multinomial(w, n_draws, replacement=True, generator=g).tolist()
     return list(enumerate(idx))

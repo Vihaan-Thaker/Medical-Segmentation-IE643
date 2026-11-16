@@ -11,6 +11,10 @@ Modes (one per SLURM step):
 Everything that turns a stored slice into a mask follows arm 1 step for step (sam_train_core).
 The logic lives in run_preflight / run_training / finalize / check_merged, so the CPU tests run
 the same code on a tiny SAM; main() only parses arguments.
+
+--modality ct / mri (D70-D71, ARM2_MOD_CODE_PLAN.md): a single-modality teacher. Train and val
+are restricted to that modality, draws are uniform within it, selection is its val Dice; the
+default (both) is arm 2 unchanged.
 """
 from __future__ import annotations
 
@@ -52,6 +56,9 @@ METRIC_FIELDS = ["epoch", "train_loss", "train_dice", "train_bce", "train_iou", 
                  "nsd3_ct@0.10", "nsd3_mri@0.10", "lr_lora", "lr_dec", "steps",
                  "ct_draws", "mri_draws", "epoch_s", "train_s", "val_s", "data_wait_s",
                  "peak_mem_gib"]
+# The modalities a run trains and selects on (D71); "both" is arm 2.
+MODALITY_SETS = {"both": ("ct", "mri"), "ct": ("ct",), "mri": ("mri",)}
+VAL_COLUMNS = ("ct@0.00", "mri@0.00", "ct@0.10", "mri@0.10", "nsd3_ct@0.10", "nsd3_mri@0.10")
 
 
 class TrainFailed(RuntimeError):
@@ -78,6 +85,7 @@ class Cfg:
     lr_floor: float = 1e-6
     clip: float = 1.0
     seed: int = 643
+    modality: str = "both"               # both (arm 2) | ct | mri (D71)
     workers: int = 10
     val_batch: int = 8
     device: str = "cuda"
@@ -118,7 +126,20 @@ STAMP_EXCLUDE = {"run_dir", "merged_out", "workers", "allow_code_change", "force
 def stamp_of(cfg: Cfg) -> dict:
     d = dataclasses.asdict(cfg)
     out = {k: v for k, v in d.items() if k not in STAMP_EXCLUDE and not k.startswith("pf_")}
+    if out.get("modality") == "both":           # arm 2's stamp stays exactly as it was
+        del out["modality"]
     return json.loads(json.dumps(out))          # tuples -> lists, canonical for comparison
+
+
+def modalities_of(cfg: Cfg) -> tuple:
+    if cfg.modality not in MODALITY_SETS:
+        raise ValueError(f"modality must be one of {sorted(MODALITY_SETS)}, not {cfg.modality!r}")
+    return MODALITY_SETS[cfg.modality]
+
+
+def dataset_modality(cfg: Cfg) -> str | None:
+    """The SliceDataset filter for this run: None (both) or "ct" / "mri"."""
+    return None if len(modalities_of(cfg)) == 2 else cfg.modality
 
 
 # ============================================================================ helpers
@@ -293,8 +314,8 @@ def items_nsd(items) -> bool:
     return getattr(items, "nsd", True)
 
 
-def summarise_val(rows: list[dict], select_level: float) -> dict:
-    s = C.val_metric(rows, select_level=select_level)
+def summarise_val(rows: list[dict], select_level: float, modalities: tuple = ("ct", "mri")) -> dict:
+    s = C.val_metric(rows, select_level=select_level, modalities=modalities)
     for mod in ("ct", "mri"):
         per = {}
         for r in rows:
@@ -474,8 +495,28 @@ def adapter_digest(sam) -> str:
 
 
 def load_datasets(cfg: Cfg):
-    return (D.SliceDataset(Path(cfg.processed), "train", cfg.expected_slices),
-            D.SliceDataset(Path(cfg.processed), "val", cfg.expected_slices))
+    mod = dataset_modality(cfg)
+    return (D.SliceDataset(Path(cfg.processed), "train", cfg.expected_slices, modality=mod),
+            D.SliceDataset(Path(cfg.processed), "val", cfg.expected_slices, modality=mod))
+
+
+def check_run_data(cfg: Cfg, train_ds, val_ds, n_draws: int) -> dict:
+    """Startup guard (D71): train and val hold exactly the run's modalities, and an epoch is
+    one draw per training slice unless n_draws was set explicitly (test hook). Returns the
+    counts recorded in run.json."""
+    want = set(modalities_of(cfg))
+    for name, ds in (("train", train_ds), ("val", val_ds)):
+        have = {r["modality"] for r in ds.rows}
+        if have != want:
+            raise SystemExit(f"{name} data holds modalities {sorted(have)}, the run ({cfg.modality}) "
+                             f"needs exactly {sorted(want)}")
+    if cfg.n_draws is None and n_draws != len(train_ds):
+        raise SystemExit(f"{n_draws} draws per epoch, but {len(train_ds)} training slices")
+    val_patients: dict = {}
+    for r in val_ds.rows:
+        val_patients.setdefault(r["modality"], set()).add(r["patient"])
+    return {"train_slices": dict(train_ds.counts), "val_slices": dict(val_ds.counts),
+            "val_patients": {m: len(p) for m, p in sorted(val_patients.items())}}
 
 
 def check_stamp_and_write(cfg: Cfg, run_dir: Path, extra: dict, log) -> dict:
@@ -541,9 +582,13 @@ def run_training(cfg: Cfg, build_plain=build_plain_vitb, datasets=None, log=prin
             return 0
 
     train_ds, val_ds = datasets if datasets is not None else load_datasets(cfg)
+    mods = modalities_of(cfg)
     n_draws = cfg.n_draws or len(train_ds)
+    data_info = check_run_data(cfg, train_ds, val_ds, n_draws)
     spe = steps_per_epoch(n_draws, cfg)
     total = spe * cfg.epochs
+    log(f"modality {cfg.modality}: train slices {data_info['train_slices']}, val slices "
+        f"{data_info['val_slices']}, val patients {data_info['val_patients']}; {n_draws} draws/epoch")
     sam, info = build_lora(cfg, build_plain, device)
     log(f"rank {cfg.rank}, alpha {cfg.alpha}: trainable {info['trainable']:,} "
         f"(LoRA {info['lora']:,} + decoder {info['decoder']:,}) of {info['total']:,}; "
@@ -566,10 +611,10 @@ def run_training(cfg: Cfg, build_plain=build_plain_vitb, datasets=None, log=prin
     def validate_row(epoch: int, extra: dict) -> dict:
         tv = time.time()
         vrows, _ = predict_val(sam, val_items, device, cfg.val_batch, cfg.workers)
-        s = summarise_val(vrows, cfg.select_level)
-        return {"epoch": epoch, **extra, **{k: round(s[k], 6) for k in
-                ("ct@0.00", "mri@0.00", "ct@0.10", "mri@0.10", "selection",
-                 "nsd3_ct@0.10", "nsd3_mri@0.10")},
+        s = summarise_val(vrows, cfg.select_level, mods)
+        # a single-modality run has no rows for the other modality: its columns are nan
+        return {"epoch": epoch, **extra, **{k: round(s.get(k, float("nan")), 6) for k in VAL_COLUMNS},
+                "selection": round(s["selection"], 6),
                 "val_s": round(time.time() - tv, 1), "lr_lora": opt.param_groups[0]["lr"],
                 "lr_dec": opt.param_groups[1]["lr"], "peak_mem_gib": peak_gib(device)}
 
@@ -597,7 +642,7 @@ def run_training(cfg: Cfg, build_plain=build_plain_vitb, datasets=None, log=prin
                            "best_epoch": 0, "best_score": best_score}, last_path)
         write_metrics(metrics_path, rows)
         log(f"epoch 0 (off-the-shelf baseline): selection {best_score:.4f}  "
-            f"CT@0.10 {row0['ct@0.10']:.4f}  MRI@0.10 {row0['mri@0.10']:.4f}")
+            + "  ".join(f"{m.upper()}@0.10 {row0[f'{m}@0.10']:.4f}" for m in mods))
 
     if done > cfg.epochs:
         raise SystemExit(f"{run_dir}: at epoch {done}, beyond the configured {cfg.epochs}")
@@ -619,7 +664,8 @@ def run_training(cfg: Cfg, build_plain=build_plain_vitb, datasets=None, log=prin
                            "best_epoch": best_epoch, "best_score": best_score}, last_path)
         write_metrics(metrics_path, rows)
         log(f"epoch {epoch}/{cfg.epochs}: loss {row['train_loss']:.4f}  val selection "
-            f"{row['selection']:.4f} (CT {row['ct@0.10']:.4f}, MRI {row['mri@0.10']:.4f})  best "
+            f"{row['selection']:.4f} ("
+            + ", ".join(f"{m.upper()} {row[f'{m}@0.10']:.4f}" for m in mods) + ")  best "
             f"{best_epoch} ({best_score:.4f})  {row['epoch_s']:.0f}s  wait {tr['data_wait_s']:.0f}s  "
             f"peak {row['peak_mem_gib']} GiB")
         if cfg.stop_after_epoch is not None and epoch == cfg.stop_after_epoch and epoch < cfg.epochs:
@@ -630,14 +676,18 @@ def run_training(cfg: Cfg, build_plain=build_plain_vitb, datasets=None, log=prin
         raise TrainFailed("frozen weights changed during training")
     if adapter_digest(sam) == state["initial_adapter_digest"]:
         raise TrainFailed("adapter never changed -- training had no effect")
+    late_best = best_epoch >= int(0.9 * cfg.epochs)      # the students' rule (D70)
     atomic_write_json(rj_path, {
         "status": "TRAIN_OK", "epochs_completed": cfg.epochs, "best_epoch": best_epoch,
         "best_score": best_score, "rank": cfg.rank, "alpha": cfg.alpha, "settings": stamp["settings"],
+        "modality": cfg.modality, "n_draws": n_draws, **data_info, "late_best": late_best,
         "base_sha256": env["base_sha256"], "manifest_sha256": env["manifest_sha256"],
         "gpu": env["gpu"], "gpu_type": env["gpu_type"], "info": info, "steps_per_epoch": spe,
         "total_steps": total, "frozen_digest": state["frozen_digest"], "host": platform.node(),
         "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
     log(f"best epoch {best_epoch}: val selection {best_score:.4f}")
+    if late_best:
+        log(f"WARNING late best epoch ({best_epoch} of {cfg.epochs}): under-trained? (D70 extension rule)")
     log("TRAIN_OK")
     return 0
 
@@ -657,6 +707,9 @@ def finalize(cfg: Cfg, build_plain=build_plain_vitb, load_plain=load_plain_vitb,
     rj = json.loads(rj_path.read_text())
     if rj.get("status") != "TRAIN_OK":
         raise SystemExit(f"{rj_path}: status {rj.get('status')}, not TRAIN_OK")
+    run_mod = rj.get("settings", {}).get("modality", "both")
+    if run_mod != cfg.modality:
+        raise SystemExit(f"{rj_path}: run trained on modality {run_mod}, finalize called with {cfg.modality}")
     if out.exists():
         rec = rj.get("merged", {})
         if rec.get("sha256") == sha256_file(out) and rec.get("check", {}).get("passed"):
@@ -728,6 +781,9 @@ def check_merged(cfg: Cfg, log=print) -> int:
         problems.append("merged checkpoint sha256 differs from run.json")
     if Path(rec.get("path", "")).resolve() != out.resolve():
         problems.append(f"run.json records {rec.get('path')}, not {out}")
+    run_mod = rj.get("settings", {}).get("modality", "both")     # arm 2's run.json has no key
+    if run_mod != cfg.modality:
+        problems.append(f"run trained on modality {run_mod}, expected {cfg.modality}")
     if problems:
         log("MERGED_FAILED: " + "; ".join(problems))
         return 1
@@ -898,6 +954,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lr-lora", type=float, default=5e-4)
     p.add_argument("--lr-dec", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=643)
+    p.add_argument("--modality", choices=sorted(MODALITY_SETS), default="both",
+                   help="both = arm 2; ct / mri = a single-modality teacher (D71)")
     p.add_argument("--workers", type=int, default=10)
     p.add_argument("--device", default="cuda")
     p.add_argument("--grad-checkpoint", action="store_true")
@@ -915,7 +973,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--finalize / --check-merged need --merged-out")
     cfg = Cfg(processed=a.processed, checkpoint=a.checkpoint, rank=a.rank, alpha=a.alpha,
               run_dir=a.run_dir, merged_out=a.merged_out, epochs=a.epochs, batch=a.batch,
-              accum=a.accum, lr_lora=a.lr_lora, lr_dec=a.lr_dec, seed=a.seed, workers=a.workers,
+              accum=a.accum, lr_lora=a.lr_lora, lr_dec=a.lr_dec, seed=a.seed,
+              modality=a.modality, workers=a.workers,
               device=a.device, grad_checkpoint=a.grad_checkpoint, expect_gpu=a.expect_gpu,
               allow_code_change=a.allow_code_change, force_new=a.force_new)
     torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "8"))))
